@@ -2,24 +2,21 @@ import copy
 import glob
 import os
 from os.path import basename
-from random import sample
+from random import sample, seed
 from scipy.spatial.distance import cdist
 import warnings
-from math import floor
 from datetime import datetime
 import cPickle
 import numpy as np
 import gc
-import subprocess
+from random import shuffle
 
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from PyML import VectorDataSet, PairDataSet
-
-from codebase.constants import dbd4_directory, pickle_directory, dbd4_object_model_file_prefix, \
-    dbd4_pair_file_prefix, pdb_directory
+from codebase.constants import dbd4_directory, pickle_directory, \
+    dbd4_sample_file_prefix, pdb_directory, dbd4_object_model_file
 from codebase.data.dbd4.abstract_database import AbstractDatabase
 from codebase.data.dbd4.dbd4_feature_extractor import DBD4FeatureExtractor
-from codebase.data.dbd4.example import ResidueInteraction
 from codebase.pairpred.model.protein import Protein
 from codebase.pairpred.model.protein_complex import ProteinComplex
 from codebase.pairpred.model.protein_pair import ProteinPair
@@ -31,7 +28,7 @@ __author__ = 'basir'
 
 
 class DBD4(AbstractDatabase):
-    def __init__(self, directory=dbd4_directory, load_from=None, generate_examples=False, **args):
+    def __init__(self, directory=dbd4_directory, load_from=None, **args):
         """
             Either loads or creates the data model and training/testing examples for DBD4 Benchmark.
 
@@ -46,28 +43,78 @@ class DBD4(AbstractDatabase):
         @kwarg seed(hashable): Random seed used to sample negative examples.
         """
         self.directory = directory
-        self.positives = {}
-        self.negatives = {}
+        self.examples = []
+        self.example_complex = {}
         self.complexes = {}
         self.residues = {}
-        self.sampled_negative = {}
         self.complexes_example_range = {}
         self.name = "Docking Benchmark Dataset 4.0"
-        self.pairs_file = ""
-
+        self.interaction_threshold = 6
+        self.samples = []
         if load_from is not None:
             self._load(load_from)
         else:
             self.positives_size = args['size']
             self.positive_to_negative_ratio = args['ratio']
-            self.interaction_threshold = args['thresh']
             self.seed = args['seed']
-            if self.__files_already_exist() and not generate_examples:
+            if os.path.exists(self.directory + pickle_directory + dbd4_object_model_file):
                 self._load()
             else:
                 self.__read_pdb_files()
                 self.__extract_examples()
                 self._save()
+
+        self.__load_samples()
+
+    def _save(self, file_name=None):
+        """
+        This function saves all the attributes of the class: positive and negative examples, ligands and receptors and
+        complex names are saved in pickle format.
+
+        """
+        if not os.path.exists(self.directory + pickle_directory):
+            os.mkdir(self.directory + pickle_directory)
+        if file_name is None:
+            object_model_file_name = self.directory + pickle_directory + dbd4_object_model_file
+        else:
+            object_model_file_name = file_name
+
+        f = open(object_model_file_name, "wb")
+        print_info_nn("Saving the object model into {0} ... ".format(object_model_file_name))
+        start_time = datetime.now()
+        cPickle.dump((self.directory,
+                      self.complexes,
+                      self.residues,
+                      self.complexes_example_range,
+                      self.examples,
+                      self.example_complex), f)
+        f.close()
+        print_info("took {0} seconds.".format((datetime.now() - start_time).seconds))
+
+    def _load(self, file_name=None):
+        """
+        This function load all the attributes of the class: positive and negative examples, ligands and receptors and
+        complex names are saved in pickle format.
+
+        """
+
+        if file_name is None:
+            object_model_file_name = self.directory + pickle_directory + dbd4_object_model_file
+        else:
+            object_model_file_name = file_name
+
+        f = open(object_model_file_name)
+        print_info_nn("Loading the object model from {0} ... ".format(object_model_file_name))
+        start_time = datetime.now()
+        (self.directory,
+         self.complexes,
+         self.residues,
+         self.complexes_example_range,
+         self.examples,
+         self.example_complex) = cPickle.load(f)
+        f.close()
+        gc.collect()
+        print_info("took {0} seconds.".format((datetime.now() - start_time).seconds))
 
     def __read_pdb_files(self):
         print_info("Parsing the pdb files in directory {0} ....".format(os.path.abspath(self.directory)))
@@ -94,21 +141,26 @@ class DBD4(AbstractDatabase):
             counter += 1
         print_info("Total number of complexes processed : " + str(counter))
 
+    def __get_residue_index(self, residue):
+        if residue not in self.residues:
+            self.residues[residue] = len(self.residues)
+        return self.residues[residue]
+
     def __extract_examples(self):
         """
-        This function returns a set of positive and negative examples from DBD4 dataset. In protein complex C,
+        This function returns the set of all positive and negative examples from DBD4 dataset. In protein complex C,
         wth receptor R and ligand L, two residues r on R and r' on L are considered as a positive example if in the
         bound form they are nearer than the threshold distance. All other pairs (r,r') with r on R and r' on L are
-        considered as negative examples. Extracted examples are saved in two dictionaries positives and negatives.
+        considered as negative examples. Extracted examples are saved in self.examples
         """
-        unique_residues = set()
         print_info("Finding the positive and negative examples in DBD4 ... {0}".format(self.positives_size))
         start_time = datetime.now()
-        pos_no = 0
-        neg_no = 0
         counter = 1
+        start_index = 0
+        neg_no = 0
+        pos_no = 0
         for complex_name in self.complexes.keys():
-            print_info("{1}/{2}... processing complex {3}".format(counter, len(self.complexes), complex_name))
+            print_info_nn("{0}/{1}... processing complex {2}".format(counter, len(self.complexes), complex_name))
             protein_complex = self.complexes[complex_name]
             bound_ligand_bio_residues = protein_complex.bound_formation.ligand.biopython_residues
             bound_receptor_bio_residues = protein_complex.bound_formation.receptor.biopython_residues
@@ -130,51 +182,31 @@ class DBD4(AbstractDatabase):
                     if bound_ligand_residues[i] in ligand_b2u and bound_receptor_residues[j] in receptor_b2u:
                         unbound_ligand_res = ligand_b2u[bound_ligand_residues[i]]
                         unbound_receptor_res = receptor_b2u[bound_receptor_residues[j]]
-                        unique_residues.add(unbound_ligand_res)
-                        unique_residues.add(unbound_receptor_res)
+                        unbound_ligand_res_index = self.__get_residue_index(unbound_ligand_res)
+                        unbound_receptor_res_index = self.__get_residue_index(unbound_receptor_res)
                         if dist_mat.min() < self.interaction_threshold:
-                            pos.append(ResidueInteraction(complex_name, unbound_ligand_res, unbound_receptor_res))
+                            pos.append((unbound_ligand_res_index, unbound_receptor_res_index, +1))
                         else:
-                            neg.append(ResidueInteraction(complex_name, unbound_ligand_res, unbound_receptor_res))
-            if pos_no + len(pos) > self.positives_size:
-                pos = pos[:(self.positives_size - pos_no)]
-
-            self.positives[complex_name] = copy.copy(pos)
-            random_indices = sample(range(len(neg)), int(floor(len(pos) * self.positive_to_negative_ratio)))
-            self.sampled_negative[complex_name] = random_indices
-            self.negatives[complex_name] = [neg[x] for x in random_indices]
+                            neg.append((unbound_ligand_res_index, unbound_receptor_res_index, -1))
+            self.examples.extend(copy.copy(pos))
+            self.examples.extend(copy.copy(neg))
+            pos_no += len(pos)
+            neg_no += len(neg)
+            self.complexes_example_range[complex_name] = (
+                start_index, start_index + len(pos), start_index + len(neg) + len(pos))
+            print_info(" ( {0:03d}/{1:05d} ) -{2}".format(len(pos), len(neg), self.complexes_example_range[complex_name]))
+            start_index += len(pos) + len(neg)
             counter += 1
-            pos_no += len(self.positives[complex_name])
-            neg_no += len(self.negatives[complex_name])
-            if pos_no >= self.positives_size:
-                break
-        self.__add_residues(list(unique_residues))
+            all_e = pos + neg
+            for e in all_e:
+                self.example_complex["{0}_{1}".format(e[0], e[1])] = complex_name
+
         print_info("Finding examples in DBD4 took " + str((datetime.now() - start_time).seconds) + " seconds. ")
         print_info("The total number of examples found: " + str(pos_no + neg_no))
 
-    def _save(self):
-        """
-        This function saves all the attributes of the class: positive and negative examples, ligands and receptors and
-        complex names are saved in pickle format.
-
-        """
-        object_model_file_name = self.__get_file_name(pickle_directory + dbd4_object_model_file_prefix, "cpickle")
-        f = open(object_model_file_name, "wb")
-        print_info_nn("Saving the object model into {0} ... ".format(object_model_file_name))
-        start_time = datetime.now()
-        self.pairs_file = self.create_pairs_files()
-        cPickle.dump((self.directory,
-                      self.complexes,
-                      self.residues,
-                      self.pairs_file,
-                      self.complexes_example_range,
-                      self.sampled_negative), f)
-        f.close()
-        print_info("took {0} seconds.".format((datetime.now() - start_time).seconds))
-
     def get_pair_index_map(self):
         pair_index_map = {}
-        lines = [line.strip() for line in open(self.pairs_file)]
+        lines = [line.strip() for line in open(self.sample_file)]
         counter = 0
         for line in lines:
             pid = line.split()[0]
@@ -182,96 +214,80 @@ class DBD4(AbstractDatabase):
             counter += 1
         return pair_index_map
 
-    def _load(self, file_names=None):
-        """
-        This function load all the attributes of the class: positive and negative examples, ligands and receptors and
-        complex names are saved in pickle format.
-
-        """
-
-        if file_names is None:
-            object_model_file_name = self.__get_file_name(pickle_directory + dbd4_object_model_file_prefix, "cpickle")
-        else:
-            object_model_file_name = file_names[0]
-
-        f = open(object_model_file_name)
-        print_info_nn("Loading the object model from {0} ... ".format(object_model_file_name))
-        start_time = datetime.now()
-        (self.directory,
-         self.complexes,
-         self.residues,
-         self.pairs_file,
-         self.complexes_example_range,
-         self.sampled_negative) = cPickle.load(f)
-        f.close()
-        gc.collect()
-        print_info("took {0} seconds.".format((datetime.now() - start_time).seconds))
-
     def __get_file_name(self, prefix, extension):
-        return self.directory + prefix + "{0}-{1}-{2}-{3}.{4}".format(self.positives_size,
-                                                                      self.positive_to_negative_ratio,
-                                                                      self.interaction_threshold,
-                                                                      self.seed,
-                                                                      extension)
+        return self.directory + prefix + "{0}-{1}-{2}.{3}".format(self.positives_size, self.positive_to_negative_ratio,
+                                                                  self.seed, extension)
 
-    def create_pairs_files(self):
-        pair_file_name = self.__get_file_name(dbd4_pair_file_prefix, "pair")
-        if os.path.exists(pair_file_name):
-            return pair_file_name
-        pair_file = open(pair_file_name, "wr")
-        start_index = 0L
-        for complex_name in self.complexes.keys():
-            pos_index = 0L
-            neg_index = 0L
-            if complex_name not in self.positives:
-                continue
+    def __load_samples(self):
+        """"
+        Based on three provided parameters self.positives_size, self.positive_to_negative_ratio and self.seed it picks
+        a number of samples from the pool of self.examples.
+        """""
+        seed(self.seed)
+        self.pyml_pair_file = self.__get_file_name(dbd4_sample_file_prefix, "pair")
+        self.sample_file = self.__get_file_name(pickle_directory, "cpickle")
+        if os.path.exists(self.sample_file):
+            with open(self.sample_file) as sample_file:
+                self.samples = cPickle.load(sample_file)
+        else:
+            positive_indices = []
+            negative_indices = []
+            for i, example in enumerate(self.examples):
+                if example[2] == 1:
+                    positive_indices.append(i)
+                else:
+                    negative_indices.append(i)
 
-            for positives_example in self.positives[complex_name]:
-                ligand_index = str(self.residues[positives_example.ligand_residue])
-                receptor_index = str(self.residues[positives_example.receptor_residue])
-                pair_file.write("{0}_{1} +1\n".format(ligand_index, receptor_index))
-                pos_index += 1
+            if self.positives_size != -1 and self.positives_size < len(positive_indices):
+                p_indices = sample(positive_indices, self.positives_size)
+            else:
+                p_indices = positive_indices
+            if -1 == self.positive_to_negative_ratio or int(self.positives_size * self.positive_to_negative_ratio) > len(
+                    negative_indices):
+                n_indices = negative_indices
+            else:
+                n_indices = sample(negative_indices, int(self.positives_size * self.positive_to_negative_ratio))
+            # saving to files
+            with open(self.pyml_pair_file, "wr") as pair_file:
+                indices = copy.copy(p_indices)
+                indices.extend(copy.copy(n_indices))
+                for i in indices:
+                    example = self.examples[i]
+                    if example[2] > 0:
+                        pair_file.write("{0}_{1} +1\n".format(*example))
+                    else:
+                        pair_file.write("{0}_{1} -1\n".format(*example))
+            # interleaving positive and negative examples for when we call get_cv_folds
+            # this is NECESSARY because pyml will complain if there is no example from a class
+            # and this is very likely to happen because #positive << #negatives.
+            # so dont remove this !
+            p_head = 0
+            n_head = 0
+            for i in range(len(self.examples)):
+                if i == p_indices[p_head] and p_head < len(p_indices)-1:
+                    self.samples.append(p_indices[p_head])
+                    p_head += 1
+                if i == n_indices[n_head] and n_head < len(n_indices)-1:
+                    self.samples.append(n_indices[n_head])
+                    n_head += 1
+            #self.samples = p_indices + n_indices
 
-            for negatives_example in self.negatives[complex_name]:
-                ligand_index = str(self.residues[negatives_example.ligand_residue])
-                receptor_index = str(self.residues[negatives_example.receptor_residue])
-                pair_file.write("{0}_{1} -1\n".format(ligand_index, receptor_index))
-                neg_index += 1
-            self.complexes_example_range[complex_name] = (start_index,
-                                                          start_index + pos_index,
-                                                          start_index + pos_index + neg_index)
-            start_index += neg_index + pos_index
-        pair_file.close()
-        return pair_file_name
+            with open(self.sample_file, "wr") as sample_file:
+                cPickle.dump(self.samples, sample_file)
 
-    def get_pyml_dataset(self, features, paired_data=False, **kwargs):
+    def get_pyml_dataset(self, features, **kwargs):
         uncomputed_features = self.__get_uncomputed_features(features)
         if len(uncomputed_features) != 0:
             DBD4FeatureExtractor.extract(features, self, **kwargs)
         reversed_dictionary = {index: residue for residue, index in self.residues.iteritems()}
         x = np.zeros((len(self.residues), reversed_dictionary[1].get_vector_form(features).shape[0]))
         for i in range(len(self.residues)):
-            vector_form = reversed_dictionary[i + 1].get_vector_form(features)
+            vector_form = reversed_dictionary[i].get_vector_form(features)
             x[i, :] = vector_form
         data_set = VectorDataSet(x)
-        if paired_data:
-            pair_file_name = self.create_pairs_files()
-            return PairDataSet(pair_file_name, data=data_set)
-        else:
-            return data_set
-
-    def __add_residues(self, residue_list):
-        for residue in residue_list:
-            self.residues[residue] = len(self.residues) + 1
-
-    def __files_already_exist(self):
-        object_model_file_name = self.__get_file_name(pickle_directory + dbd4_object_model_file_prefix, "cpickle")
-        examples_file_name = self.__get_file_name(dbd4_pair_file_prefix, "pair")
-        return os.path.exists(object_model_file_name) and os.path.exists(examples_file_name)
+        return PairDataSet(self.pyml_pair_file, data=data_set)
 
     def __get_uncomputed_features(self, features):
-        # a_complex = self.complexes[self.complexes.keys()[-1]]
-        # a_residue = a_complex.unbound_formation.receptor.residues[0]
         a_residue = self.residues.keys()[0]
         uncomputed_features = []
         computed_features = set(a_residue.get_computed_features())
@@ -281,60 +297,58 @@ class DBD4(AbstractDatabase):
         return uncomputed_features
 
     def get_cv_folds(self, number_of_folds):
-        if len(self.residues) == 0 or len(self.complexes_example_range) == 0:
-            raise StandardError("examples information does not exist!")
+        with open(self.sample_file) as file:
+            self.samples = cPickle.load(file)
+		
+        shuffle(self.samples)
+        complex_examples = {}
+        average_no_examples = len(self.samples)/number_of_folds
+        print "Average Number of Examples {0} ".format(average_no_examples)
+        for example in self.samples:
+            for complex_name in self.complexes_example_range:
+                (pos_start, neg_start, end) = self.complexes_example_range[complex_name]
+                if pos_start <= example < end:
+                    if complex_name not in complex_examples:
+                        complex_examples[complex_name] = []
+                    complex_examples[complex_name].append(example)
+
+        folds = []
         training = []
         testing = []
-        number_of_examples = int(subprocess.check_output('wc -l %s' % self.pairs_file, shell=True).strip().split()[0])
-        # print ">>>>" + str(number_of_examples)
-        average_size_of_folds = 0
-        for complex_name in self.sampled_negative.keys():
-            interval = self.complexes_example_range[complex_name]
-            average_size_of_folds += interval[1] - interval[0] + len(self.sampled_negative[complex_name])
-
-        average_size_of_folds /= number_of_folds
-        # average_size_of_folds = number_of_examples / number_of_folds
-        # print "Average number of examples {0}".format(average_size_of_folds)
-        folds = []
         for i in range(number_of_folds):
             folds.append([])
             testing.append([])
             training.append([])
+
         current_fold = 0
         current_length = 0
-        for complex_name in self.sampled_negative.keys():
-            interval = self.complexes_example_range[complex_name]
-            interval_length = interval[1] - interval[0] + len(self.sampled_negative[complex_name])
-            if current_length + interval_length > average_size_of_folds:
+        index = 0
+        l = 1
+        labels = []
+        for complex_name in complex_examples:
+            if current_length + len(complex_examples[complex_name]) > average_no_examples:
                 current_length = 0
                 current_fold += 1
+                labels.append(l)
+                l = 1
                 if current_fold == number_of_folds:
                     break
-            folds[current_fold].append(complex_name)
-            current_length += interval_length
-
+            for i in complex_examples[complex_name]:
+                folds[current_fold].append(index)
+                l *= self.examples[self.samples[index]][2]
+                index += 1
+                current_length += 1
+         
         for fold in range(number_of_folds):
-            testing_complexes = folds[fold]
-            training_complexes = []
+            testing[fold] = folds[fold]
             for i in range(number_of_folds):
                 if i != fold:
-                    training_complexes.extend(folds[i])
-            for complex_name in testing_complexes:
-                pos_start, pos_end, neg_end = self.complexes_example_range[complex_name]
-                for example_id in range(pos_start, neg_end):
-                    testing[fold].append(example_id)
-            for complex_name in training_complexes:
-                pos_start, pos_end, neg_end = self.complexes_example_range[complex_name]
-                for example_id in range(pos_start, pos_end):
-                    training[fold].append(example_id)
-                # training[fold].extend(self.sampled_negative[complex_name])
-                training[fold] = list(set(range(number_of_examples)) - set(testing[fold]))
-
+                    training[fold].extend(folds[i])
+        print "HERE COME THE LABELS: {0}".format(labels)
         return training, testing
 
-
 if __name__ == "__main__":
-    pos_examples_no = 500
+    pos_examples_no = 10
     ratio_of_neg_to_pos_examples = 1
     pos_example_thresh = 6
     d = DBD4(size=pos_examples_no, ratio=ratio_of_neg_to_pos_examples, thresh=pos_example_thresh, seed=10)

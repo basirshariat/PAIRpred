@@ -34,7 +34,7 @@ class Experiment:
 
     def run(self, **kwargs):
         self.run_parameters = kwargs
-        data = self.database.get_pyml_dataset(self.features, True, **kwargs)
+        data = self.database.get_pyml_dataset(self.features, **kwargs)
         data.attachKernel('gaussian', gamma=kwargs['gamma'], normalization='cosine')  # normalization='cosine'
         if self.classifier == Classifier.SVM:
             # svm = SVM()
@@ -67,7 +67,7 @@ class Experiment:
         for fold in self.pyml_result:
             complex_length_map = {}
             for i in range(len(fold.L)):
-                complex_name = example_complex_map[example_index_map[fold.patternID[i]]]
+                complex_name = self.database.example_complex[fold.patternID[i]]
                 if complex_name not in complex_length_map:
                     complex_length_map[complex_name] = 0
                 complex_length_map[complex_name] += 1
@@ -80,7 +80,7 @@ class Experiment:
             complex_length_map = complex_length_folds[fold_no]
             for i in range(len(fold.L)):
                 pid = fold.patternID[i]
-                complex_name = example_complex_map[example_index_map[pid]]
+                complex_name = self.database.example_complex[pid]
                 if complex_name not in complex_performance_map:
                     example_no = complex_length_map[complex_name]
                     complex_performance_map[complex_name] = ndarray((example_no, 3))
@@ -88,7 +88,7 @@ class Experiment:
 
                 perf_table = complex_performance_map[complex_name]
                 length = complex_length_map[complex_name]
-                perf_table[length, :] = [int(fold.L[i]), 2 * int(fold.Y[i]) - 1, fold.decisionFunc[i]]
+                perf_table[length, :] = [int(fold.Y[i]), int(fold.givenY[i]), fold.decisionFunc[i]]
                 complex_length_map[complex_name] += 1
                 number_of_examples_in_complex = perf_table.shape[0]
                 if complex_length_map[complex_name] == number_of_examples_in_complex:
@@ -128,7 +128,7 @@ def save_results(number_of_samples, results, feature_sets):
     for feature_set in feature_sets:
         features_list_rep.append([])
         for feature in feature_set:
-            features_list_rep[-1].append(feature.value)
+            features_list_rep[-1].append(feature)
     filename_prefix = reports_directory + "kernel/Complex-Wise-{0}-{1}".format(number_of_samples, features_list_rep)
     print filename_prefix
     print filename_prefix
@@ -165,15 +165,15 @@ def main():
     print_info("Starting the experiment")
     start_time = datetime.now()
     seed = 1
-    number_of_samples = 500
-    # number_of_samples = 20000
-    dbd4 = DBD4(size=number_of_samples, ratio=1, thresh=6, seed=seed)
+    #number_of_samples = 5000
+    number_of_samples = 20000
+    dbd4 = DBD4(size=number_of_samples, ratio=-1, seed=seed)
     mtrand.seed(seed)
     feature_sets = [
-        [
-            Features.WINDOWED_POSITION_SPECIFIC_SCORING_MATRIX,
-            Features.WINDOWED_POSITION_SPECIFIC_FREQUENCY_MATRIX,
-        ],
+        #[
+        #    Features.WINDOWED_POSITION_SPECIFIC_SCORING_MATRIX,
+        #    Features.WINDOWED_POSITION_SPECIFIC_FREQUENCY_MATRIX,
+        #],
         # [
         #     Features.WINDOWED_POSITION_SPECIFIC_SCORING_MATRIX,
         #     Features.D2_PLAIN_SHAPE_DISTRIBUTION
@@ -187,11 +187,11 @@ def main():
         #     Features.RELATIVE_ACCESSIBLE_SURFACE_AREA,
         #     Features.D2_SURFACE_SHAPE_DISTRIBUTION
         # ],
-        # [
-        #     Features.WINDOWED_POSITION_SPECIFIC_SCORING_MATRIX,
-        #     Features.RELATIVE_ACCESSIBLE_SURFACE_AREA,
-        #     Features.D1_SURFACE_SHAPE_DISTRIBUTION
-        # ],
+         [
+             Features.WINDOWED_POSITION_SPECIFIC_SCORING_MATRIX,
+             Features.RELATIVE_ACCESSIBLE_SURFACE_AREA,
+             Features.D1_SURFACE_SHAPE_DISTRIBUTION
+         ],
         # [
         #     Features.WINDOWED_POSITION_SPECIFIC_SCORING_MATRIX,
         #     Features.D2_CATEGORY_SHAPE_DISTRIBUTION
